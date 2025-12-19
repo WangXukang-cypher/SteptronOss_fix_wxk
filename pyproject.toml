@@ -115,3 +115,9 @@ skip_empty = true
 branch = true
 source = ["steptronoss"]
 
+[tool.isort]
+profile = "black"
+line_length = 120
+py_version = 310
+known_first_party = "steptronoss"
+known_third_party = "wandb"
