@@ -17,6 +17,38 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+dependencies = [
+    "aiohttp",
+    "aioredis",
+    "boto3",
+    "configurize",
+    "einops",
+    "fastapi",
+    "hjson",
+    "ijson",
+    "loguru",
+    "megfile",
+    "msgpack",
+    "numpy",
+    "packaging",
+    "pyyaml",
+    "redis",
+    "safetensors",
+    "setuptools",
+    "tabulate",
+    "torch",
+    "tqdm",
+    "transformers",
+    "triton",
+    "uvicorn",
+    "wandb",
+    "httpx",
+]
+
+
+
+[tool.uv.sources]
+nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm.git" }
 
 [project.urls]
 Homepage = "https://Randomizez.github.io/SteptronOss/"
@@ -35,7 +67,14 @@ dev = [
     "mkdocs>=1.6.1",
     "mkdocs-material>=9.7.0",
     "mkdocstrings[python]>=1.0.0",
+    "black",
+    "isort",
+    "py-spy",
+    "debugpy",
 ]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 [build-system]
 requires = ["hatchling"]
@@ -56,6 +95,11 @@ show_error_codes = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "cpu: CPU-only tests",
+    "gpu: GPU-only tests",
+    "node2: requires 2 processes (torchrun --nproc-per-node=2)",
+]
 
 [tool.ruff]
 target-version = "py39"
