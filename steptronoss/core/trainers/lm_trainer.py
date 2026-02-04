@@ -51,6 +51,8 @@ class DecoderPretrainTrainer(BaseTrainer):
         )
         self._skipped_iters = 0
 
+        self.train_iters: int = None
+
         self.build_hooks(self.exp.trainer_cfg)
 
     # Functions for Training:
@@ -115,6 +117,14 @@ class DecoderPretrainTrainer(BaseTrainer):
 
         ## Dataloader
         self.train_data_iterators = self.build_dataloader(self.exp.data_cfg)
+        if self.exp.trainer_cfg.train_iters is None:
+            self.train_iters = self._compute_and_broadcast_train_iters()
+        else:
+            self.train_iters = self.exp.trainer_cfg.train_iters
+
+        if self.exp.scheduler_cfg.total_schedule is None:
+            self.exp.scheduler_cfg.total_schedule = self.train_iters
+
         if "data" in state_dicts:
             for dl in self.train_data_iterators:
                 if hasattr(dl, "load_state_dict"):
@@ -151,7 +161,7 @@ class DecoderPretrainTrainer(BaseTrainer):
         # Negative log_level won't be recorded to log files
         self.timers("interval-time", log_level=-1).start(barrier=True)
 
-        while self.iteration < self.exp.trainer_cfg.train_iters:
+        while self.iteration < self.train_iters:
             update_successful = self.train_step()
             # Logging.
             elapsed_time = self.timers("interval-time").elapsed(barrier=False, sync_device=True)
@@ -277,7 +287,7 @@ class DecoderPretrainTrainer(BaseTrainer):
         # 开销大的操作放到log interval的整数倍处执行
         if self.iteration % self.exp.trainer_cfg.log_interval == 0:
             # let timer stat prior to globalMetrics to avoid external synchronize
-            timers_prefix = f"iteration {self.iteration:8d}/{self.exp.trainer_cfg.train_iters:8d}"
+            timers_prefix = f"iteration {self.iteration:8d}/{self.train_iters:8d}"
             self.timers.log(
                 self.iteration,
                 self.exp.trainer_cfg.log_interval,
@@ -306,7 +316,7 @@ class DecoderPretrainTrainer(BaseTrainer):
             )
 
             logs = {
-                "iter": f"{self.iteration:8d}/{self.exp.trainer_cfg.train_iters:8d}",
+                "iter": f"{self.iteration:8d}/{self.train_iters:8d}",
                 "cum-tokens": convert_num(int(self.history["consumed_tokens"])),
                 "ms/iter": f"{metrics['iteration_time'] * 1000.0:.1f}",
                 "tokens-per-second-per-card": f"{tokens_per_second_per_card:.1f}",
@@ -390,6 +400,38 @@ class DecoderPretrainTrainer(BaseTrainer):
 
         sync_point("after dataloaders are built")
         return train_data_iterators
+
+    def _compute_and_broadcast_train_iters(self) -> int:
+        """Compute train_iters from data source rank and broadcast to all ranks.
+
+        Since only data source ranks (PP=0||PP=-1 && TP=0 && CP=0) build dataloaders,
+        we need to broadcast the computed num_packed_samples to all ranks.
+        """
+        # Get local num_packed_samples (only data source has valid value)
+        if self.exp.trainer_cfg.is_data_source():
+            local_num_samples = self.train_data_iterators[0].nextable.nextable.packing_result.num_packed_samples
+        else:
+            local_num_samples = 0
+
+        # Broadcast to all ranks using world group
+        num_samples_tensor = torch.tensor([local_num_samples], dtype=torch.long, device="cuda")
+
+        # Dynamically determine the source rank for broadcast
+        # Data source rank is PP=0||PP=-1 && TP=0 && CP=0
+        # Get the global rank corresponding to PP group rank 0
+        data_source_rank = mpu.PM.ranks_of("PP")[0]
+        torch.distributed.broadcast(num_samples_tensor, src=data_source_rank)
+        num_packed_samples = num_samples_tensor.item()
+
+        # Compute train_iters (same for all ranks)
+        train_iters = num_packed_samples // self.exp.trainer_cfg.global_batch_size
+
+        logger.info(
+            f"Will train for {train_iters} iters.",
+            at=0,
+        )
+
+        return train_iters
 
     # Checkpointing:
     def set_autoresume(self):
