@@ -1,57 +1,114 @@
-Config Principle
+## Installation
 
-Core idea
-- Separate stateful objects (e.g., Optimizer) from stateless configs (e.g., OptimizerConfig).
-- Config only describes parameters and structure.
-- Config provides build() (or build_*) to create the real object.
+```bash
+# from repo root
+uv sync
+```
 
-How to define a Config
-- Inherit from Config.
-- Use type hints to declare required parameters and their types.
-- Sub-configs are declared as class attributes (type + class attr).
-- Concrete values are assigned on the instance (typically in __init__).
-- Use Ref("..path") to reference other nodes in the config tree.
-- Config.__init__ will instantiate all sub-configs declared as class attrs.
+### Optional: Optimization Kernels
 
-How to use a Config
-- sanity_check(): validate required attributes and constraints.
-- to_dict(): serialize config for logging or saving.
+See the **Optimization Kernels** section for installation and enablement.
 
-Example (minimal)
+## Getting Started
+
+### Experiment Overview & Sanity Check
+
+```bash
+# Overview the experiment config and run sanity_check
+cfshow playground/rlvr/qwen3_1p5b_rlvr_math.py
+# Inspect a specific subtree (e.g., actor config)
+cfshow playground/rlvr/qwen3_1p5b_rlvr_math.py -k actor_cfg
+```
+
+### Run Experiments
+
+```bash
+# Single-task experiments (e.g., SFT)
+torchrun playground/sft/your_exp.py
+
+# Multi-task experiments (e.g., RL)
+export STEPTRON_MEET_DIR=/path/to/shared
+tools/mp_run.py playground/rlvr/qwen3_1p5b_rlvr_math.py
+
+# mp_run is also compatible with single-task experiments
+tools/mp_run.py playground/sft/your_exp.py
+
+# Override experiment params (example: enable timer logging)
+tools/mp_run.py playground/rlvr/qwen3_1p5b_rlvr_math.py profiler_cfg.timing_log_level=1
+```
+
+### Runtime Environment
+
+Distributed rendezvous spins up a per-experiment Redis server using a shared
+filesystem directory.
+
+- `STEPTRON_MEET_DIR`: shared directory visible and writable by all nodes. It
+  stores the rendezvous file that publishes the Redis server port.
+- `CANNOT_BE_REDIS_SERVER=1`: set on ranks that must not start Redis (they will
+  wait for another rank to start it). If every rank sets this, rendezvous will
+  eventually time out.
+
+## Zen
+
+Core principles:
+- Keep configs stateless; runtime objects carry state.
+- Declare config structure at class level, fill values in `__init__`.
+- Use `Ref("..path")` for cross-node linkage.
+- Call `sanity_check()` and `to_dict()` for validation/serialization.
+
+Configurize example:
 
 ```python
-from configurize import Config, Ref
+# Before
+class A:
+    def __init__(self, param_a: int, param_b: float = 1.0):
+        pass
 
-# Base config: only types, no values
-class OptimizerConfig(Config):
-    lr: float
-    weight_decay: float
+# After
+from configurize import Config
 
-    def build(self, params):
-        return Optimizer(params, lr=self.lr, weight_decay=self.weight_decay)
+class AConfig(Config):
+    param_a: int
+    param_b: float = 1.0
 
+    def build(self):
+        return A(cfg=self)
 
-# Concrete config: assigns values
-class MyOptimizerConfig(OptimizerConfig):
-    def __init__(self):
-        super().__init__()
-        self.lr = 1e-4
-        self.weight_decay = 0.01
+    def sanity_check(self):
+        super().sanity_check()
+        assert self.param_b > 0
 
+class A:
+    def __init__(self, cfg: AConfig):
+        pass
+```
 
-class TrainerConfig(Config):
-    lr: float
-    optimizer_cfg: OptimizerConfig = MyOptimizerConfig  # class attr defines sub-config type
+## Optimization Kernels
 
-    def __init__(self):
-        super().__init__()
-        self.lr = 1e-4
-        # reference parent value
-        self.optimizer_cfg.lr = Ref("..lr")
+### flash-attn
 
+Install manually:
 
-cfg = TrainerConfig()
-cfg.sanity_check()
-print(cfg.to_dict())
-optim = cfg.optimizer_cfg.build(params)
+```bash
+uv pip install flash-attn
+```
+
+### grouped_gemm
+
+Install manually:
+
+```bash
+pip install --verbose git+https://github.com/fanshiqing/grouped_gemm@main
+```
+
+### Enable in code (set all optimizations at once)
+
+```python
+from steptronoss.utils.optimizable import set_optimization
+
+set_optimization(
+    default="torch_compile",
+    AttentionCore="flash-attn",
+    grouped_gemm="nv_grouped_gemm",
+)
 ```

@@ -7,7 +7,7 @@ import megfile
 import torch
 from loguru import logger
 
-from steptronoss.checkpointing.local_checkpoint import dump_ckpt, load_ckpt
+from steptronoss.checkpointing.local_checkpoint import Checkpointer
 from steptronoss.core import parallel_state as mpu
 from steptronoss.core import tensor_parallel
 from steptronoss.core.parallel_state import PM, get_vpp_size, set_vpp_rank
@@ -25,10 +25,10 @@ from steptronoss.optimizer.hparam_scheduler import Scheduler
 from steptronoss.timers import init_timers
 from steptronoss.utils import (
     convert_num,
-    get_mem_brief,
     print_n_params,
     setup_logger,
 )
+from steptronoss.utils.memory_tracker import CMT
 from steptronoss.utils.metrics import GlobalMetrics
 
 GlobalMetrics: PretrainMetricConfig
@@ -39,8 +39,7 @@ class DecoderPretrainTrainer(BaseTrainer):
 
     def __init__(self, exp: PretrainExp):
         self.exp = exp
-
-        self.uploading_threads = []
+        self.checkpointer = Checkpointer()
 
         self.history = dict(
             consumed_samples=0,
@@ -93,6 +92,7 @@ class DecoderPretrainTrainer(BaseTrainer):
 
         ## Model
         self.models = self.setup_model(self.exp.model_cfg)
+        CMT.mark("after_build_model")
 
         if "model" in state_dicts:
             load_model_checkpoint(
@@ -135,7 +135,7 @@ class DecoderPretrainTrainer(BaseTrainer):
         if self.exp.checkpoint_cfg.save_path and self.iteration != 0:
             # Do not use async dump since training is done.
             with self.exp.checkpoint_cfg.modify(async_dump=False):
-                self.save_checkpoint(path=os.path.join(self.exp.checkpoint_cfg.save_path, f"it{self.iteration}"))
+                self.save_checkpoint()
 
         for hook in self._after_train_hooks:
             hook(self)
@@ -159,40 +159,21 @@ class DecoderPretrainTrainer(BaseTrainer):
         # Negative log_level won't be recorded to log files
         self.timers("interval-time", log_level=-1).start(barrier=True)
 
-        while self.iteration < self.train_iters:
+        while self.iteration < self.exp.trainer_cfg.train_iters:
+            CMT.mark("start_of_iter")
             update_successful = self.train_step()
             # Logging.
             elapsed_time = self.timers("interval-time").elapsed(barrier=False, sync_device=True)
             GlobalMetrics.iteration_time.add(elapsed_time)
             self.training_log(update_successful)
 
-            # if self.exp.trainer_cfg.eval_interval and self.exp.eval_cfg is not None:
-            #     if self.iteration % self.exp.trainer_cfg.eval_interval == 0:
-            #         if self.optimizer is not None:
-            #             self.optimizer._cpu_offload(adam_only=False, zero_grad=False)
-            #         self.evaluator.initialize(eval_model=self.models)
-            #         eval_results, eval_samples = self.evaluator.eval()
-            #         if self.evaluator.is_master:
-            #             logger.info(
-            #                 f"Eval: Iter: {self.iteration}, {' | '.join([f'{k}: {v}' for k, v in eval_results.items()])}"
-            #             )
-            #             try_save(
-            #                 eval_samples,
-            #                 self.exp.checkpoint_cfg.save_path
-            #                 + f"/eval_samples_it{self.iteration}.pt",
-            #             )
-            #         if self.tb_writer:
-            #             for k, v in eval_results.items():
-            #                 self.tb_writer.add_scalar(f"Eval/{k}", v, self.iteration)
-            #         if self.optimizer is not None:
-            #             self.optimizer._cpu_backload(adam_only=False)
             if (
                 self.exp.checkpoint_cfg.save_path
                 and self.exp.checkpoint_cfg.save_interval
                 and self.iteration % self.exp.checkpoint_cfg.save_interval == 0
                 and self.iteration > self.start_iteration
             ):
-                self.save_checkpoint(path=os.path.join(self.exp.checkpoint_cfg.save_path, f"it{self.iteration}"))
+                self.save_checkpoint()
             # empty cache after first run to clean all init buffers
             # this reduces peak memory usage
             if self.iteration == self.start_iteration:
@@ -230,6 +211,7 @@ class DecoderPretrainTrainer(BaseTrainer):
                     self.grad_manager._cpu_offload(adam_only=False, zero_grad=False)
 
             pp_scheduler.run(grad_accumulation_steps)
+        CMT.mark("after_forward_backward")
 
         # Empty unused memory.
         if self.exp.trainer_cfg.empty_unused_memory_level >= 1:
@@ -242,6 +224,7 @@ class DecoderPretrainTrainer(BaseTrainer):
         # Update parameters.
         with self.timers.record("optimizer-step", log_level=1):
             update_successful, grad_norm, num_zeros_in_grad = self.grad_manager.step()
+        CMT.mark("after_optimizer_step")
         MoEBlock.update_router_balance_bias_per_gbs(self.models)
 
         GlobalMetrics.grad_norm.add(grad_norm)
@@ -266,6 +249,7 @@ class DecoderPretrainTrainer(BaseTrainer):
         with self.timers.record("after-step-hooks", log_level=1):
             for hook in self._after_step_hooks:
                 hook(self)
+        CMT.mark("after_step_hooks")
 
         return update_successful
 
@@ -327,9 +311,8 @@ class DecoderPretrainTrainer(BaseTrainer):
             if user_logs:
                 logs.update(user_logs)
             log_string = " | ".join(f"{k}: {v}" for k, v in logs.items())
-            log_string = log_string + " | " + get_mem_brief().split("Report")[1].strip()
-
             logger.info(log_string, at=-1)
+            CMT.report_over_world()
 
     # Builders:
     def setup_model(self, model_config: Megatron3DParallelModelConfig) -> torch.nn.ModuleList:
@@ -453,7 +436,8 @@ class DecoderPretrainTrainer(BaseTrainer):
     def load_checkpoint(self):
         cfg = self.exp.checkpoint_cfg
 
-        state_dicts, extra = load_ckpt(cfg.load_path, cfg)
+        state_dicts = self.checkpointer.load_ckpt(cfg.load_path, cfg)
+        extra = state_dicts.get("extra_info", {})
         if cfg.load_option.exp and "exp" in extra:
             self.exp.assert_critical_attrs_expected(extra)
 
@@ -461,41 +445,21 @@ class DecoderPretrainTrainer(BaseTrainer):
 
         return state_dicts
 
-    def join_dumping_thread(self):
-        """ensure all dumping threads are finished"""
-        dumping_flag = torch.tensor(0, device=torch.cuda.current_device())
-        working_threads = [x for x in self.uploading_threads if x is not None]
-        if working_threads:  # An uploader exists
-            for thread in working_threads:
-                if thread.is_alive():
-                    dumping_flag += 1
-        torch.distributed.all_reduce(dumping_flag)
+    def save_checkpoint(self):
 
-        if dumping_flag > 0:
-            logger.warning("Last uploading not finished. Consider increasing your save_interval!")
-            if working_threads:
-                for t in working_threads:
-                    t.join()
-        self.uploading_threads = []
-
-    def save_checkpoint(self, path):
-
-        self.join_dumping_thread()
+        self.checkpointer.join_dumping_thread()
 
         sync_point("ready for dump")
         # Now dump
 
-        self.uploading_threads.append(
-            dump_ckpt(
-                path,
-                cfg=self.exp.checkpoint_cfg,
-                iteration=self.iteration,
-                model=self.models,
-                optimizer=self.grad_manager,
-                opt_param_scheduler=self.opt_param_scheduler,
-                dataloader=self.train_data_iterators[0],
-                extra_info={"exp": self.exp.to_dict(), "history": self.history},
-            )
+        self.checkpointer.dump_ckpt(
+            cfg=self.exp.checkpoint_cfg,
+            iteration=self.iteration,
+            model=self.models,
+            optimizer=self.grad_manager,
+            opt_param_scheduler=self.opt_param_scheduler,
+            dataloader=self.train_data_iterators[0],
+            extra_info={"exp": self.exp.to_dict(), "history": self.history},
         )
 
     def __repr__(self):

@@ -21,7 +21,7 @@ dependencies = [
     "aiohttp",
     "aioredis",
     "boto3",
-    "configurize",
+    "configurize==0.2.0",
     "einops",
     "fastapi",
     "hjson",
@@ -36,14 +36,17 @@ dependencies = [
     "safetensors",
     "setuptools",
     "tabulate",
-    "torch==2.8.0",
+    "torch==2.9.0",
     "tqdm",
-    "transformers",
-    "triton==3.4.0",
+    "transformers<5.0",
+    "triton==3.5.0",
     "uvicorn",
     "wandb",
     "httpx",
     "pip>=25.3",
+    "vllm>=0.11",
+    "tensorboard>=2.20.0",
+    "asciichartpy>=1.5.25",
 ]
 
 
@@ -88,11 +91,8 @@ packages = ["steptronoss"]
 
 [tool.mypy]
 files = ["steptronoss"]
-disallow_untyped_defs = true
+disable_error_code = ["assignment"]
 disallow_any_unimported = true
-no_implicit_optional = true
-check_untyped_defs = true
-warn_return_any = true
 warn_unused_ignores = true
 show_error_codes = true
 

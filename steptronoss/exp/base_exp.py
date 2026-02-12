@@ -10,6 +10,7 @@ from typing import (
     ForwardRef,
     Literal,
     NoReturn,
+    Optional,
 )
 
 import torch
@@ -23,6 +24,7 @@ from steptronoss.exp.abstract import ParallelConfig as AbstractParallelConfig
 from steptronoss.exp.abstract import TokenizerConfig as AbstractTokenizerConfig
 from steptronoss.exp.abstract import TrainerConfig as AbstractTrainerConfig
 from steptronoss.exp.optimizer import AdamConfig, OptimizerConfig
+from steptronoss.exp.resources import ResourceConfig
 
 if TYPE_CHECKING:
     from steptronoss.core.pipeline_parallel.schedules import FWBWScheduler
@@ -96,6 +98,8 @@ class MetricConfig(AbstractMetricConfig):
 
 
 class TrainerConfig(AbstractTrainerConfig):
+    micro_batch_size: int = 1
+
     train_iters: int | None = None
 
     offload_optimizer_state: bool = False
@@ -109,7 +113,7 @@ class TrainerConfig(AbstractTrainerConfig):
 
     log_num_zeros_in_grad: bool = True
 
-    log_interval: int = 10
+    log_interval: int = 1
 
     # writer_backend: available backends are "tensorboard", "wandb"
     # support multiple backends
@@ -390,7 +394,7 @@ class MegatronTPConfig(AbstractModelConfig):
 
     sequence_parallel: bool = False
 
-    gradient_accumulation_fusion: bool = True
+    gradient_accumulation_fusion: bool = False
     async_tensor_model_parallel_allreduce: bool = True
 
     distribute_saved_activations: bool = False
@@ -471,6 +475,8 @@ class DataConfig(Config):
 
 
 class BaseExp(Config):
+    resource_cfg: ResourceConfig = ResourceConfig
+
     seed = 1234
 
     log_dir = "./"
@@ -527,3 +533,10 @@ class BaseExp(Config):
         my_doc = inspect.getdoc(sys.modules[self.__class__.__module__])
         writer.add_text("Note", my_doc or "No-Doc", global_step=0)
         return writer
+
+    def sanity_check(self):
+        expected_world_size = self.resource_cfg.replica * max(self.resource_cfg.gpu, 1)
+        os.environ["WORLD_SIZE"] = os.environ.get(
+            "WORLD_SIZE", str(expected_world_size)
+        )  # for workspace check, fake the expected world_size
+        super().sanity_check()
