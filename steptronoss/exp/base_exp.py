@@ -42,17 +42,6 @@ class GradientManagerConfig(Config):
     params_dtype: torch.dtype = Ref("..model_cfg.params_dtype")
 
     use_distributed_optimizer: bool = True
-    optimizer_distribute_granularity: Literal["byte", "tensor"] = "tensor"
-    """Under DistributedOptimizer (zero1), optimizer state can be sharded by bytes or by tensors.
-
-    - raw: [Tensor(size=100), Tensor(size=59)]
-    - Bytes  @dp2: [Tensor(size=80, partial)], [Tensor(size=20, partial), Tensor(size=59), Pad(1)]
-    - Tensor @dp2: [Tensor(size=100)], [Tensor(size=59)]
-
-    - byte distribution can leverage reduce_scatter optimization, with less comm. But
-    does not support optimizer like muon (need grad for full tensor).
-
-    """
 
     clip_grad: float = 1.0
     log_detailed_grad_norms: bool = Ref("..trainer_cfg.log_detailed_grad_norms")
@@ -179,21 +168,21 @@ class TrainerConfig(AbstractTrainerConfig):
             pass
 
         if PM.i_am("PP", 0) or PM.i_am("PP", -1):
-            with get_timers().record("dataloader-next", log_level=2):
-                if PM.i_am("TP", 0):
-                    if PM.i_am("CP", 0):
+            if PM.i_am("TP", 0):
+                if PM.i_am("CP", 0):
+                    with get_timers().record("dataloader-next", log_level=1):
                         data = next(data_iterator)
-                    else:
-                        data = None
-                    with get_timers().record("broadcast-tensors-cp", log_level=2):
-                        data = broadcast_tensors(
-                            data,
-                            src_rank=PM.ranks_of("CP")[0],
-                            group=PM.group_of("CP"),
-                            move_to_cuda=True,
-                        )
                 else:
                     data = None
+                with get_timers().record("broadcast-tensors-cp", log_level=2):
+                    data = broadcast_tensors(
+                        data,
+                        src_rank=PM.ranks_of("CP")[0],
+                        group=PM.group_of("CP"),
+                        move_to_cuda=True,
+                    )
+            else:
+                data = None
 
             with get_timers().record("broadcast-tensors-tp", log_level=2):
                 data = broadcast_tensors(
@@ -260,27 +249,7 @@ class TrainerConfig(AbstractTrainerConfig):
         A hook is a `Callable[[Trainer], []]`
         """
 
-        def check_uninitialized_model_weight(trainer):
-            from steptronoss.core.parallel_state import PM
-            from steptronoss.utils.utils import unwrap_model
-
-            if hasattr(trainer, "models") and PM.i_am("DP", 0) and PM.i_am("TP", 0):
-                uninitialized_keys = []
-                for model in trainer.models:
-                    model = unwrap_model(model)
-                    for name, param in model.named_parameters():
-                        if not getattr(param, "has_initialized", False):
-                            uninitialized_keys.append(name)
-                if uninitialized_keys:
-                    logger.warning(
-                        f"The following parameters are not marked as initialized. "
-                        f"Please add 'init_model_weight' method in the corresponding module or its parent module "
-                        f"and mark parameters with 'has_initialized=True' after initialization:  {uninitialized_keys}"
-                    )
-
-        return [
-            check_uninitialized_model_weight,
-        ]
+        return []
 
     def build_before_step_hooks(self) -> list[TrainerHook]:
         """\

@@ -4,6 +4,7 @@ import torch
 from loguru import logger
 from torch import Tensor
 
+from steptronoss.core.parallel_state import PM
 from steptronoss.exp.abstract import ModelConfig as AbstractModelConfig
 
 
@@ -69,9 +70,10 @@ class YARNRoPE(torch.nn.Module):
         self.max_position_embeddings = max_position_embeddings
         non_repetitive_seqlen = theta * 2 * math.pi * ntk_interp_ratio
         if max_position_embeddings:
-            assert max_position_embeddings <= non_repetitive_seqlen, (
-                f"max_position_embedding larger than one rotation period ({int(non_repetitive_seqlen)})!"
-            )
+            if max_position_embeddings > non_repetitive_seqlen:
+                logger.warning(
+                    f"max_position_embedding larger than one rotation period ({int(non_repetitive_seqlen)})!"
+                )
 
         if ntk_interp_ratio != 1.0:
             assert max_position_embeddings is not None
@@ -175,8 +177,8 @@ class YARNRoPE(torch.nn.Module):
 
         return yarn_freqs
 
-    def _check_set_cos_sin_cache(self, cur_seqlen, device):
-        if cur_seqlen > self._cached_seqlen:
+    def _check_set_cos_sin_cache(self, cur_seqlen=None, device="cuda"):
+        if cur_seqlen and cur_seqlen > self._cached_seqlen:
             frequencies = self._get_frequencies(device=device)
             angles = torch.outer(torch.arange(cur_seqlen, device=device), frequencies)  # S, C / 2
             repeated_angles = angles.repeat([1, 2])
@@ -201,12 +203,12 @@ class YARNRoPE(torch.nn.Module):
         # position_id: [S, ]
 
         if position_id is not None:  # packed sample
-            max_seqlen = feature.shape[1]
+            max_seqlen = position_id.max() + 1
             cos_cache, sin_cache = self._check_set_cos_sin_cache(max_seqlen, position_id.device)
             cos = cos_cache[None, position_id, None, :].to(feature.device).to(feature.dtype)
             sin = sin_cache[None, position_id, None, :].to(feature.device).to(feature.dtype)
         else:  # no packing
-            max_seqlen = feature.shape[1]
+            max_seqlen = feature.shape[1] * PM.size_of("CP")
             cos_cache, sin_cache = self._check_set_cos_sin_cache(max_seqlen, feature.device)
             cos = cos_cache[None, :max_seqlen, None, :].to(feature.device)
             sin = sin_cache[None, :max_seqlen, None, :].to(feature.device)
