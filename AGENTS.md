@@ -29,6 +29,7 @@ Not every interaction needs an improvement pass. But for **key tasks**, do an Im
 
 ### Repo Layout & Utilities
 - Repo layout: core package under `steptronoss/` (core, model, data, exp, optimizer, generation, tokenizer, utils, checkpointing); experiments live in `playground/`; tests in `tests/`.
+- Setup: besides `uv sync`, install `redis-server` (`apt install -y redis-server`).
 - `steptronoss/utils`: `arguments.parse_args` config overrides; `comm_utils` Redis rendezvous/queue + `LocalFuture`/`RemoteFuture`; `dist_utils` broadcast/all_to_all helpers, dict<->tensor packing, list balancing; `general` numeric helpers, list split/balance, RNG fork, retry, recur_to, git hash; `logger` rank-aware log + `StepWriter`; `metrics` Metric/Avg/Percentage/Histogram/Text/GradNorm and `GlobalMetrics`; `optimizable` decorator + `set_optimization`; `utils` model unwrap, param norm, mem report, layer map, jsonl/msgpack IO, generic load; `weight_loader` HF safetensors key mapping/merge.
 
 ### Experiments & Configs

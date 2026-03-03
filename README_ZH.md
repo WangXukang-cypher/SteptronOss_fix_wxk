@@ -26,6 +26,8 @@ StepTronOSS 是一个面向大规模语言模型训练的轻量化框架，强�
 ```bash
 # 在 repo 根目录执行
 uv sync
+# 安装 redis-server
+apt install -y redis-server
 ```
 
 ## 快速开始

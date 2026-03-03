@@ -27,6 +27,8 @@
 ```bash
 # from repo root
 uv sync
+# install redis-server
+apt install -y redis-server
 ```
 
 ## Getting Started
