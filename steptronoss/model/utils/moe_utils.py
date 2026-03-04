@@ -1,5 +1,9 @@
 import torch
 
+try:
+    from steptronoss.model.utils.triton.grouped_gemm import triton_grouped_gemm
+except:
+    triton_grouped_gemm = None
 from steptronoss.utils.memory_tracker import CMT
 from steptronoss.utils.optimizable import optimizable
 
@@ -306,7 +310,12 @@ def nv_grouped_gemm(mat_a_flat, mat_b, batch_sizes, trans_b=False):
     return grouped_gemm_ops.gmm(mat_a_flat, mat_b, batch_sizes, trans_b=trans_b)
 
 
-@optimizable(alternatives={"nv_grouped_gemm": nv_grouped_gemm})
+@optimizable(
+    alternatives={
+        "nv_grouped_gemm": nv_grouped_gemm,
+        "triton_grouped_gemm": triton_grouped_gemm,
+    }
+)
 def grouped_gemm(mat_a_flat, mat_b, batch_sizes, trans_b=False):
     batch_sizes_list = batch_sizes.tolist()
     outputs = []
