@@ -19,15 +19,13 @@
 最小结构示意（字段名仅作结构参考，不包含具体内容）：
 
 ```json
-[
-  {
-    "conversations": [
-      {"role": "user", "content": "..."},
-      {"role": "assistant", "content": "..."}
-    ],
-    "images": null
-  }
-]
+{
+  "conversations": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ],
+  "images": null
+}
 ```
 
 更详细的 item 结构示意（字段名仅作结构参考，不包含具体内容）：
@@ -107,8 +105,10 @@ class MyDatasetsConfig(CompliableDatasetsConfig):
 
 说明：
 - `domains`：按域组织文件列表（每个文件是 `DataSourceFile`）。
-- `epochs`：采样策略（按域设置 epoch 权重）。
 - `subsample_rate` 范围为 (0, 1]，用于下采样。
+- `epochs`：采样策略（按域设置 epoch 权重），和 `Megatron-LM`参数语义保持一致。
+
+  > 例如 `general` 有 1000 条数据，`subsample_rate=0.3,epoch=2`；`math` 有 500 条数据，DatasetsConfig 共 `1000*0.3+500` 条，随后在 dataloader 进行加权采样，最终生成 `1000*0.3*2+500*1`条数据。
 
 ## 3) （可选）编译 datasets
 
