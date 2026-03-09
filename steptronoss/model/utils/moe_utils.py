@@ -1,14 +1,71 @@
 import torch
 
 try:
-    from steptronoss.model.utils.triton.grouped_gemm import triton_grouped_gemm
+    from steptronoss.model.optimizations.grouped_gemm.function_imple import function_imple_grouped_gemm
+except:
+    function_imple_grouped_gemm = None
+
+try:
+    from steptronoss.model.optimizations.moe_routing.triton import (
+        triton_histogram,
+        triton_index_compute,
+        triton_index_scatter,
+    )
+except:
+    triton_histogram = None
+    triton_index_compute = None
+    triton_index_scatter = None
+
+try:
+    from steptronoss.model.optimizations.routed_grouped_ffn.triton import triton_routed_grouped_ffn_fused
+except:
+    triton_routed_grouped_ffn_fused = None
+
+try:
+    from steptronoss.model.optimizations.grouped_gemm.triton import triton_grouped_gemm
 except:
     triton_grouped_gemm = None
+
+try:
+    from steptronoss.model.optimizations.moe_gather.triton import triton_moe_weighted_gather
+except:
+    triton_moe_weighted_gather = None
+
+try:
+    from steptronoss.model.optimizations.moe_scatter.triton import triton_moe_scatter
+except:
+    triton_moe_scatter = None
+from steptronoss.timers import timeit
 from steptronoss.utils.memory_tracker import CMT
 from steptronoss.utils.optimizable import optimizable
 
 
-@optimizable()
+class MoEGateFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, fp32_output):
+        ctx.fp32_output = fp32_output
+        ctx.save_for_backward(x, weight)
+        if fp32_output:
+            y = torch.matmul(x.float(), weight.t().float())
+        else:
+            y = torch.matmul(x, weight.t())
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        if ctx.fp32_output:
+            grad_output = grad_output.to(x)
+        grad_input = torch.matmul(grad_output, weight)
+        grad_weight = torch.matmul(grad_output.t(), x)
+        return grad_input, grad_weight, None
+
+
+@optimizable(
+    alternatives={
+        "triton": triton_histogram,
+    }
+)
 def histogram(top_k_rank: torch.Tensor, expert_num: int) -> torch.Tensor:
     """Count how many tokens route to each expert id.
 
@@ -51,7 +108,11 @@ def histogram(top_k_rank: torch.Tensor, expert_num: int) -> torch.Tensor:
     return counts.to(torch.int32)
 
 
-@optimizable()
+@optimizable(
+    alternatives={
+        "triton": triton_index_compute,
+    }
+)
 def index_compute(indices: torch.Tensor, expert_histogram: torch.Tensor) -> torch.Tensor:
     """Compute stable scatter indices for expert-ordered buffers.
 
@@ -132,6 +193,36 @@ def index_compute(indices: torch.Tensor, expert_histogram: torch.Tensor) -> torc
     return flat_out.reshape_as(out).to(torch.int32)
 
 
+@optimizable(
+    alternatives={
+        "fused": triton_routed_grouped_ffn_fused,
+    }
+)
+def routed_grouped_ffn(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    act,
+    x: torch.Tensor,
+    token_expert_ids: torch.Tensor,
+    token_weights: torch.Tensor,
+) -> torch.Tensor:
+    experts_histogram = histogram(token_expert_ids, w1.shape[0])
+    if experts_histogram.numel() == 0 or int(experts_histogram.sum().item()) == 0:
+        return x * token_weights.sum()
+    batch_sizes = experts_histogram.long()
+    with timeit("moe-compute-index", level=2):
+        scatter_index = index_compute(token_expert_ids, experts_histogram)
+    with timeit("moe-scatter", level=2):
+        x = moe_scatter(x, scatter_index)
+    with timeit("moe-grouped-gemm-act", level=2):
+        x = grouped_gemm(x, w1, batch_sizes=batch_sizes, trans_b=True)
+        x = act(x)
+        x = grouped_gemm(x, w2, batch_sizes=batch_sizes, trans_b=True)
+    with timeit("moe-gather", level=2):
+        x = moe_weighted_gather(x, scatter_index, token_weights)
+    return x
+
+
 class MoEWeightedGather(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -195,7 +286,11 @@ class MoEWeightedGather(torch.autograd.Function):
         return grad_in, None, grad_weight
 
 
-@optimizable()
+@optimizable(
+    alternatives={
+        "triton": triton_moe_weighted_gather,
+    }
+)
 def moe_weighted_gather(
     input: torch.Tensor,
     index: torch.Tensor,
@@ -283,7 +378,11 @@ class MoEScatter(torch.autograd.Function):
         return grad_input, None
 
 
-@optimizable()
+@optimizable(
+    alternatives={
+        "triton": triton_moe_scatter,
+    }
+)
 def moe_scatter(input: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
     """Scatter token inputs into expert-ordered buffer.
 
@@ -307,6 +406,8 @@ def nv_grouped_gemm(mat_a_flat, mat_b, batch_sizes, trans_b=False):
     if xm == 0:
         b, m, n = mat_b.shape
         return mat_a_flat.new_zeros((xm, m if trans_b else n))
+    if batch_sizes.is_cuda:
+        batch_sizes = batch_sizes.cpu()
     return grouped_gemm_ops.gmm(mat_a_flat, mat_b, batch_sizes, trans_b=trans_b)
 
 
@@ -314,6 +415,7 @@ def nv_grouped_gemm(mat_a_flat, mat_b, batch_sizes, trans_b=False):
     alternatives={
         "nv_grouped_gemm": nv_grouped_gemm,
         "triton_grouped_gemm": triton_grouped_gemm,
+        "function_imple": function_imple_grouped_gemm,
     }
 )
 def grouped_gemm(mat_a_flat, mat_b, batch_sizes, trans_b=False):

@@ -1,7 +1,7 @@
 """Copyright 2026 StepFun Inc. All Rights Reserved."""
 
 from collections.abc import Callable
-from functools import partial
+from functools import cached_property, partial
 
 import torch
 import torch.distributed as dist
@@ -21,12 +21,10 @@ from steptronoss.core.tensor_parallel.mappings import (
 from steptronoss.exp.base_exp import MegatronTPConfig
 from steptronoss.exp.ntp import MoePretrainMetricConfig
 from steptronoss.model.utils import (
+    MoEGateFunction,
     bind_aux_loss,
-    grouped_gemm,
     histogram,
-    index_compute,
-    moe_scatter,
-    moe_weighted_gather,
+    routed_grouped_ffn,
 )
 from steptronoss.timers import timeit
 from steptronoss.utils.metrics import GlobalMetrics
@@ -60,6 +58,8 @@ class MoEConfig(Config):
     """Scale applied to the router auxiliary loss."""
     moe_hidden_size: int
     """Hidden size of the expert MLP (inner dimension)."""
+    fp32_gate_output: bool = False
+    """Whether MoE gate output should be computed in fp32."""
 
     routed_scaling_factor: float
     """Final scaling applied to routed outputs after aux-loss binding."""
@@ -67,17 +67,16 @@ class MoEConfig(Config):
     """Use sigmoid routing probabilities instead of softmax."""
     router_bias_update_rate: float
     """Update rate for router_balance_bias in aux-loss-free load balancing."""
-    moe_enable_deepep: bool
-    """Enable DeepEP expert-parallel dispatch when EP > 1."""
     # moe_deepep_num_sms: int
     # """Number of SMs reserved for DeepEP kernels/dispatcher."""
-
     # fuse_moescatter_and_moecolumn: bool
     # """Enable fused scatter+column expert kernel path when available."""
     enable_auxiliary_loss_free_load_balance: bool
     """Track local tokens and apply router_balance_bias for load balancing."""
     norm_expert_weight: bool
     """Normalize top-k expert weights after routing."""
+    force_balance: bool = False
+    """Force equal token counts per expert by round-robin assignment."""
 
     moe_layer_list: list
     """Layer ids that use MoE; used to compute moe_layer_id."""
@@ -101,14 +100,16 @@ class MoEGate(nn.Module):
         dim: int,
         num_experts: int,
         sequence_parallel=False,
+        fp32_output: bool = False,
     ):
         super().__init__()
         self.sequence_parallel = sequence_parallel
+        self.fp32_output = fp32_output
         self.weight = torch.nn.Parameter(torch.empty(num_experts, dim, device=torch.cuda.current_device()))
         self.weight.sequence_parallel = sequence_parallel
 
     def forward(self, x):
-        logits = x @ self.weight.T
+        logits = MoEGateFunction.apply(x, self.weight, self.fp32_output)
         return logits
 
 
@@ -155,32 +156,14 @@ class GroupedExperts(torch.nn.Module):
         self.w2.expert_model_parallel = True
 
     def forward(self, x: torch.FloatTensor, token_expert_ids, token_weights):
-        experts_histogram = histogram(token_expert_ids, self.num_local_experts)
-
-        # When all expert counts are zero (e.g., all indices invalid after dispatch),
-        # skip grouped_gemm to avoid backend asserts and return zeros while still
-        # participating in the ETP reduction.
-        if experts_histogram.numel() == 0 or int(experts_histogram.sum().item()) == 0:
-            x = reduce_from_tensor_model_parallel_region(x, group="ETP")
-            x = x * token_weights.sum()
-            return x
-        with timeit("moe-compute-index", level=2):
-            scatter_index = index_compute(token_expert_ids, experts_histogram)
-
-        with timeit("moe-scatter", level=2):
-            x = moe_scatter(x, scatter_index)
-
-        experts_histogram = experts_histogram.cpu().long()  # groupgemm need
-
-        with timeit("moe-grouped-gemm-act", level=2):
-            x = grouped_gemm(x, self.w1, batch_sizes=experts_histogram, trans_b=True)
-
-            x = self.activation(x)
-
-            x = grouped_gemm(x, self.w2, batch_sizes=experts_histogram, trans_b=True)
-
-        with timeit("moe-gather", level=2):
-            x = moe_weighted_gather(x, scatter_index, token_weights)
+        x = routed_grouped_ffn(
+            self.w1,
+            self.w2,
+            self.activation,
+            x,
+            token_expert_ids,
+            token_weights,
+        )
 
         x = reduce_from_tensor_model_parallel_region(x, group="ETP")
         return x
@@ -204,6 +187,7 @@ class MoEBlock(nn.Module):
             dim=cfg.hidden_size,
             num_experts=cfg.moe_num_experts,
             sequence_parallel=cfg.tp_cfg.sequence_parallel,
+            fp32_output=cfg.fp32_gate_output,
         )
 
         self.experts = GroupedExperts(cfg=cfg, layer_id=layer_id)
@@ -267,10 +251,19 @@ class MoEBlock(nn.Module):
             # Traditional: same probabilities for both selection and weights
             _sorted_prob, _sorted_indices = torch.sort(gate_prob, descending=True, stable=True)
 
-        topk_prob, token_expert_ids = (
-            _sorted_prob[:, : self.moe_top_k],
-            _sorted_indices[:, : self.moe_top_k].contiguous(),
-        )
+        if self.cfg.force_balance:
+            total_slots = logits.size(0) * self.moe_top_k
+            if self.moe_top_k > self.num_global_experts:
+                raise ValueError("force_balance requires top_k <= num_experts")
+            base = torch.arange(total_slots, device=logits.device, dtype=torch.int64)
+            token_expert_ids = (base % self.num_global_experts).view(logits.size(0), self.moe_top_k)
+            token_expert_ids = token_expert_ids.to(_sorted_indices.dtype, copy=False).contiguous()
+            topk_prob = gate_prob.gather(1, token_expert_ids)
+        else:
+            topk_prob, token_expert_ids = (
+                _sorted_prob[:, : self.moe_top_k],
+                _sorted_indices[:, : self.moe_top_k].contiguous(),
+            )
 
         token_weights = topk_prob
 
@@ -353,20 +346,28 @@ class MoEBlock(nn.Module):
             x = slice_to_sequence_parallel_region(x, group="ETP")
         return x
 
+    @cached_property
+    def dispatcher(self):
+        from steptronoss.model.ep_dispatcher.token_dispatcher import TokenDispatcher
+
+        dispatcher = TokenDispatcher("EP", num_experts=self.cfg.moe_num_experts)
+        return dispatcher
+
     def forward_experts_ep(self, x, token_expert_ids, token_weights):
         assert PM.size_of("ETP") == 1
-        # scatter_index = index_compute(token_expert_ids, experts_histogram)
-        from steptronoss.model.ep_dispatcher.token_dispatcher import TorchA2ADispatcher
-
-        dispatcher = TorchA2ADispatcher("EP", num_experts=self.cfg.moe_num_experts)
+        raw_token_count = len(x)
 
         with timeit("moe-token-dispatch", level=2):
-            x, token_expert_ids, token_weights = dispatcher.dispatch(x, token_expert_ids, token_weights)
+            x, token_expert_ids, token_weights = self.dispatcher.dispatch(x, token_expert_ids, token_weights)
+
+        GlobalMetrics.peak_to_avg_ratio.add(
+            (token_expert_ids != -1).sum() / raw_token_count / self.cfg.moe_top_k, subname=f"layer{self.moe_layer_id}"
+        )
 
         x = self.experts(x, token_expert_ids, token_weights)
 
         with timeit("moe-token-combine", level=2):
-            x = dispatcher.combine(x)
+            x = self.dispatcher.combine(x)
 
         return x
 
