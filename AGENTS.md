@@ -62,6 +62,49 @@ Improve pass:
   - `model_cfg` / `data_cfg` declared as class attrs
   - trainer / checkpoint / model fields adjusted in `__init__`
   - entrypoint is `if __name__ == "__main__": Exp().train()`
+
+## 4. Setup Priors
+
+- After `uv sync`, also install `redis-server`:
+  - `apt install -y redis-server`
+
+### DeepEP build
+
+- Set:
+  - `CUDA_HOME=/data/cuda/cuda-12.9/cuda`
+  - `CUDACXX=$CUDA_HOME/bin/nvcc`
+- Install:
+  - `pip install -e /data/DeepEP --no-build-isolation`
+
+### nv-grouped-gemm build
+
+- Do not rely on random prebuilt wheels; ABI mismatch is common.
+- Build with CUDA 12.9:
+  - `CUDA_HOME=/data/cuda/cuda-12.9/cuda CUDACXX=/data/cuda/cuda-12.9/cuda/bin/nvcc <python> -m pip install -e <grouped_gemm_source> --no-build-isolation`
+- Runtime constraints:
+  - `batch_sizes` must be CPU-visible / `torch.int64`
+  - inputs must be bf16 for `nv_grouped_gemm`
+
+## 3. Code Style
+
+### Config style
+
+- Config class fields should include a short triple-quoted docstring immediately after the attribute definition.
+- Follow the `configurize` pattern:
+  - class attrs declare sub-config types
+  - instance `__init__` sets concrete values
+  - use `Ref("..path")` for cross-node linkage
+  - configs expose `build()` / `build_*`, `sanity_check()`, `to_dict()`
+- Only `Ref(...)` the exact parameter needed, not whole config objects.
+
+### Experiment style
+
+- SFT experiments under `playground/sft/qwen3/*_sft_step3_data.py` typically follow:
+  - `class Exp(BaseExp)`
+  - `model_cfg` / `data_cfg` declared as class attrs
+  - trainer / checkpoint / model fields adjusted in `__init__`
+  - entrypoint is `if __name__ == "__main__": Exp().train()`
+- `playground/sft/qwen3/qwen3_sft_base.py` already provides `OneNodeResourceConfig` with `replica=1` and `gpu=8`, so derived SFT experiments default to single-node 8-GPU `torchrun` unless they override `resource_cfg`.
 - Under `playground/data/sft`, keep raw source recipes and dataset configs distinct in naming:
   - `*_recipe*.py` for `DataRecipe` / source file lists only
   - `*_data_config*.py` for `CompliableDatasetsConfig`, `CompiledDatasetsConfig`, and `SFTDataConfig`
@@ -84,12 +127,8 @@ Improve pass:
 ### nv-grouped-gemm build
 
 - Do not rely on random prebuilt wheels; ABI mismatch is common.
-- Use repo source in `third_party/grouped_gemm`.
-- Ensure CUTLASS headers exist by linking to FlashInfer CUTLASS:
-  - `rmdir third_party/grouped_gemm/third_party/cutlass`
-  - `ln -s .venv/lib/python3.10/site-packages/flashinfer/data/cutlass third_party/grouped_gemm/third_party/cutlass`
 - Build with CUDA 12.9:
-  - `CUDA_HOME=/data/cuda/cuda-12.9/cuda CUDACXX=/data/cuda/cuda-12.9/cuda/bin/nvcc .venv/bin/pip install -e third_party/grouped_gemm --no-build-isolation`
+  - `CUDA_HOME=/data/cuda/cuda-12.9/cuda CUDACXX=/data/cuda/cuda-12.9/cuda/bin/nvcc <python> -m pip install -e <grouped_gemm_source> --no-build-isolation`
 - Runtime constraints:
   - `batch_sizes` must be CPU-visible / `torch.int64`
   - inputs must be bf16 for `nv_grouped_gemm`
@@ -151,6 +190,7 @@ Improve pass:
   - `virtual_pipeline_model_parallel_size`
   - `get_vpp_rank()`
   - `set_vpp_rank()`
+- `model_cfg.pipeline_activation_cpu_offload` applies to both `PPScheduler` and `VPPScheduler`; it is implemented with `torch.autograd.graph.save_on_cpu(...)`, currently requires `model_cfg.recompute=True`, and should be treated as graph-preserving activation offload rather than a replacement for `recompute`.
 
 ### EP / TP sizing
 
@@ -192,6 +232,7 @@ Improve pass:
 - In experiments, prefer overriding `optimizer_cfg` via a `GradientManagerConfig` subclass that sets `optimizer_cfg = MuonConfig`
 - Leave distributed optimizer on, but avoid byte-level sharding
 - For Muon tests, prefer composing existing reshape ops instead of inventing new ones
+- In `playground/sft/step3/*muon*`, `Step3p5MuonConfig.mark_muon_params` inlines the base Muon selection rules but tags trainable params with `ndim >= 2` as Muon candidates (still respecting embedding/name exclusions); Step3.5 Flash `GroupedExperts` merge ops use `UnbindMoE + Inverse(Column/RowParallel + KeepThisTP(group="ETP"))`.
 
 ### Triton workflow
 
@@ -227,3 +268,4 @@ Improve pass:
 - `steptronoss.utils.memory_tracker.CMT` only records when `MEM_DIAGNOSE=1`
 - If training hangs on `Waiting for debugger... ip: ... rank: 56`, check for a stray `debug(56)` in `steptronoss/core/trainers/lm_trainer.py`
 - TorchDynamo graph breaks are often triggered by `Tensor.item()` in optimizable helpers; prefer tensor-safe checks like masked `amax` + `torch._assert`
+- `steptronoss/model/common/rope.py` should keep RoPE cos/sin caches and cache-generation math in `torch.float32`; module-wide `.to()/cuda()/bfloat16()` may move the cache device, but must not downcast the cache dtype.
