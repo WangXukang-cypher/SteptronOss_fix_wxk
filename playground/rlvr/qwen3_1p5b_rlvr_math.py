@@ -46,7 +46,6 @@ class FakeGenableGenerator(Nextable):
         self,
         endpoint_getter,
         model_name_getter,
-        sampling_params: dict[str, Any],
         prompt_text: str,
         gt: str,
         max_tokens: int,
@@ -54,7 +53,6 @@ class FakeGenableGenerator(Nextable):
         super().__init__()
         self.endpoint_getter = endpoint_getter
         self.model_name_getter = model_name_getter
-        self.sampling_params = sampling_params
         self.prompt_text = prompt_text
         self.gt = gt
         self.max_tokens = max_tokens
@@ -63,7 +61,7 @@ class FakeGenableGenerator(Nextable):
         return SimpleTrainable(
             endpoint_getter=self.endpoint_getter,
             model_name_getter=self.model_name_getter,
-            sampling_params=self.sampling_params,
+            sampling_params={},
             prompt_text=self.prompt_text,
             gt=self.gt,
             max_tokens=self.max_tokens,
@@ -88,7 +86,6 @@ class MathPromptDataConfig(DataConfig):
         endpoint_getter = EndpointGetter(vllm_cfg.router_addr_key)
         model_name_getter = ModelNameGetter(vllm_cfg.model_name_template)
         max_tokens = 1024
-        sampling_params = vllm_cfg.get_sampling_params({"max_tokens": max_tokens})
         tokenizer = self.build_tokenizer()
         messages = [
             {
@@ -100,7 +97,6 @@ class MathPromptDataConfig(DataConfig):
         return FakeGenableGenerator(
             endpoint_getter=endpoint_getter,
             model_name_getter=model_name_getter,
-            sampling_params=sampling_params,
             prompt_text=prompt_text,
             gt="3",
             max_tokens=max_tokens,
@@ -111,9 +107,9 @@ class Qwen3TokenizerConfig(TokenizerConfig):
     tokenizer_path: str = "/oss/opensources_model/Qwen3-1.7B/"
 
     def build_tokenizer(self):
-        from transformers import AutoTokenizer
+        from steptronoss.tokenizer.hf_compat_tokenizer import load_hf_tokenizer
 
-        return AutoTokenizer.from_pretrained(self.tokenizer_path, trust_remote_code=True)
+        return load_hf_tokenizer(self.tokenizer_path, trust_remote_code=True)
 
 
 class TinyRLVRResourceConfig(ResourceConfig):
