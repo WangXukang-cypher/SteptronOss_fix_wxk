@@ -164,6 +164,8 @@ Improve pass:
 - Some keys map indirectly:
   - `disable_qk_norm` ↔ `use_qk_norm` (inverted)
   - `use_swiglu_limit` ↔ `swiglu_limit`
+- For `ImageForInsert` multimodal embeddings with context parallel, do image insertion on the full embedding sequence first and only then call `scatter_to_balanced_cp_region(...)`; scattering `input_ids` before multimodal tok-embedding breaks insert-location alignment.
+- `steptronoss/model/common/vit.py` is now a TP-sharded vision transformer: qkv / out projection and MLP use TP-partitioned linear layers, while patch embedding and downsamplers stay replicated.
 - If you change `num_layers`, keep all layer-wise lists in sync:
   - `qk_rope_head_dim`
   - `rope_theta`
@@ -230,6 +232,7 @@ Improve pass:
   - `expert_tensor_parallel_size=1`
   - otherwise MoE MP size becomes 64 and the config is invalid
 - In mixed dense/MoE topologies, expert params are reduced over `EDP`, not dense `DP`; the current gradient manager compensates with `TP/EP` scaling on expert grad buffers before the `EDP` reduction, so check that path before blaming an apparent extra `EP` factor.
+- `MeshConnector` treats ranks that differ only in its configurable `dup_dim` as duplicate payload holders; Step3V passes `dup_dim=["TP"]`. Callers should keep all ranks on the same `forward()` / `backward()` sequence; empty batch shards skip the auxiliary encoder but still participate in connector return traffic.
 
 ### Checkpoint reshape
 
@@ -289,6 +292,7 @@ Improve pass:
 
 - `rg` may be unavailable; fall back to `find` / `grep`
 - `python` may be missing and `python3` may not include `pytest`; prefer project tooling if available
+- Some tensor-parallel model builders allocate on CUDA unconditionally; for CPU-only smoke tests around Step3.* multimodal `forward_head` / reshaper behavior, prefer a thin toy wrapper that reuses the real model methods with CPU-safe fake embeddings instead of building the full model.
 - `tests/conftest.py` now applies a shared skip to every `@pytest.mark.node2` test unless the run is launched under `torchrun --nproc-per-node=2`; plain `pytest` should skip them instead of hanging in distributed init.
 
 ### GPU test notes
